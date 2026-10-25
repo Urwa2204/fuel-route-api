@@ -132,8 +132,8 @@ What the import does with the CSV:
 
 | Request | Time |
 |---|---|
-| First request after server start (loads stations, makes the external calls) | XX s |
-| Same route again (served from cache) | XX ms |
+| First request after server start (loads stations, makes the external calls) | 8.44 s |
+| Same route again (served from cache) | 0.05 ms |
 
 ## Configuration
 
