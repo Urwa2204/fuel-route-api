@@ -56,6 +56,8 @@ def plan_stops(stations, total_miles, max_range=500.0, mpg=10.0, min_saving=0.0,
                     f"No fuel station within {max_range:.0f} miles after mile {pos:.0f}."
                 )
             buy(max_range - fuel)
-            go_to(min(ahead, key=lambda s: (s["price"], -s["miles"])))
-
+            #go_to(min(ahead, key=lambda s: (s["price"], -s["miles"])))
+            lowest = min(s["price"] for s in ahead)
+            near_best = [s for s in ahead if s["price"] <= lowest + min_saving]
+            go_to(max(near_best, key=lambda s: s["miles"]))
     return [s for s in stops if s["gallons"] > eps]

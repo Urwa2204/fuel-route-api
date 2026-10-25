@@ -1,7 +1,8 @@
+import hashlib
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-import hashlib
 
 import numpy as np
 import requests
@@ -14,24 +15,68 @@ from .planner import plan_stops
 
 ORS = "https://api.openrouteservice.org"
 LATLON = re.compile(r"^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$")
+CITY_ST = re.compile(r"^\s*(.+?)\s*,\s*([A-Za-z]{2})\s*(?:,\s*(?:USA|US))?\s*$")
+
+http = requests.Session()   # reuses the connection between calls
 
 
 class RoutingError(Exception):
     pass
 
 
+@lru_cache(maxsize=1)
+def load_stations():
+    rows = list(
+        FuelStation.objects.filter(lat__isnull=False)
+        .values("name", "address", "city", "state", "price", "lat", "lon")
+    )
+    xyz = to_xyz([r["lat"] for r in rows], [r["lon"] for r in rows])
+    return rows, xyz
+
+
+@lru_cache(maxsize=1)
+def load_cities():
+    """(city, state) -> (lat, lon), built from the stations we already geocoded."""
+    rows, _ = load_stations()
+    acc = {}
+    for r in rows:
+        k = (r["city"].lower(), r["state"])
+        s = acc.setdefault(k, [0.0, 0.0, 0])
+        s[0] += r["lat"]
+        s[1] += r["lon"]
+        s[2] += 1
+    return {k: (v[0] / v[2], v[1] / v[2]) for k, v in acc.items()}
+
+
+def local_geocode(text):
+    """'City, ST' that we already know from the station data: no API call needed."""
+    m = CITY_ST.match(text)
+    if not m:
+        return None
+    city, state = m.group(1).strip().lower(), m.group(2).upper()
+    hit = load_cities().get((city, state))
+    if not hit:
+        return None
+    return {"label": f"{city.title()}, {state}, USA", "lat": hit[0], "lon": hit[1]}
+
+
 def geocode(text):
-    """'lat,lon' is used as-is (no API call). Anything else is looked up once and cached."""
+    """'lat,lon' is used as-is. A known 'City, ST' is looked up locally.
+    Anything else is looked up once with the routing service and cached."""
     m = LATLON.match(text)
     if m:
         return {"label": text.strip(), "lat": float(m.group(1)), "lon": float(m.group(3))}
+
+    local = local_geocode(text)
+    if local:
+        return local
 
     key = "geo:" + hashlib.md5(text.strip().lower().encode()).hexdigest()
     hit = cache.get(key)
     if hit:
         return hit
 
-    r = requests.get(
+    r = http.get(
         f"{ORS}/geocode/search",
         params={"api_key": settings.ORS_API_KEY, "text": text,
                 "boundary.country": "US", "size": 1},
@@ -55,11 +100,12 @@ def get_route(start, finish):
     if hit:
         return hit
 
-    r = requests.post(
+    r = http.post(
         f"{ORS}/v2/directions/driving-car/geojson",
         json={
             "coordinates": [[start["lon"], start["lat"]], [finish["lon"], finish["lat"]]],
             "instructions": False,
+            "radiuses": [-1, -1],   # city centres are not always on a road, so allow any snapping distance
         },
         headers={"Authorization": settings.ORS_API_KEY},
         timeout=30,
@@ -80,32 +126,26 @@ def get_route(start, finish):
     return out
 
 
-@lru_cache(maxsize=1)
-def load_stations():
-    rows = list(
-        FuelStation.objects.filter(lat__isnull=False)
-        .values("name", "address", "city", "state", "price", "lat", "lon")
-    )
-    xyz = to_xyz([r["lat"] for r in rows], [r["lon"] for r in rows])
-    return rows, xyz
-
-
 def build_plan(start_text, finish_text):
     t0 = time.perf_counter()
-    start = geocode(start_text)
-    finish = geocode(finish_text)
+
+    # load station data in this thread first, so the worker threads below only read from memory
+    rows, xyz = load_stations()
+    load_cities()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        start, finish = pool.map(geocode, [start_text, finish_text])
+
     route = get_route(start, finish)
     total = route["miles"]
 
     profile = build_profile(route["coords"], total)
-    rows, xyz = load_stations()
     mask, along, dist = stations_near_route(profile, xyz, settings.MAX_DETOUR_MILES)
 
     candidates = [
         {**rows[i], "miles": float(along[i]), "detour": float(dist[i])}
         for i in np.flatnonzero(mask)
     ]
-    #stops = plan_stops(candidates, total, settings.VEHICLE_RANGE_MILES, settings.VEHICLE_MPG)
     stops = plan_stops(
         candidates, total,
         settings.VEHICLE_RANGE_MILES, settings.VEHICLE_MPG,
